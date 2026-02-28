@@ -37,14 +37,11 @@ object ActionExecutor {
 
     fun parseResponse(json: String): AgentAction? {
         return try {
-            val cleanJson = json
-                .replace("```json", "").replace("```", "")
-                .trim()
-                .let { raw ->
-                    val start = raw.indexOf('{')
-                    val end = raw.lastIndexOf('}')
-                    if (start >= 0 && end > start) raw.substring(start, end + 1) else raw
-                }
+            val cleanJson = extractJsonObject(json)
+            if (cleanJson == null) {
+                Log.e(TAG, "No JSON found in: ${json.take(200)}")
+                return null
+            }
 
             val obj = JSONObject(cleanJson)
             AgentAction(
@@ -60,9 +57,42 @@ object ActionExecutor {
                 reason = obj.optString("reason", "").takeIf { it.isNotEmpty() }
             )
         } catch (e: Exception) {
-            Log.e(TAG, "Parse failed: $json", e)
+            Log.e(TAG, "Parse failed: ${json.take(200)}", e)
             null
         }
+    }
+
+    /**
+     * Robust JSON extraction — handles:
+     * - Clean JSON: {"action":"click"...}
+     * - Markdown wrapped: ```json\n{...}\n```
+     * - Text before/after JSON: "Sure! Here's the action: {...} Let me know"
+     * - Multiple JSON objects (takes first)
+     */
+    private fun extractJsonObject(raw: String): String? {
+        // Strip markdown code fences
+        val stripped = raw
+            .replace(Regex("```json\\s*"), "")
+            .replace(Regex("```\\s*"), "")
+            .trim()
+
+        // Find first balanced { ... }
+        val start = stripped.indexOf('{')
+        if (start < 0) return null
+
+        var depth = 0
+        for (i in start until stripped.length) {
+            when (stripped[i]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return stripped.substring(start, i + 1)
+                }
+            }
+        }
+        // Unbalanced — try best effort
+        val end = stripped.lastIndexOf('}')
+        return if (end > start) stripped.substring(start, end + 1) else null
     }
 
     /**
@@ -87,6 +117,12 @@ object ActionExecutor {
             "open_url" -> executeOpenUrl(action, service)
             "tap_xy" -> executeTapXY(action, service)
             "swipe" -> executeSwipe(action, service)
+            "long_press" -> executeLongPress(action, service)
+            "screenshot" -> executeScreenshot(service)
+            "copy" -> executeCopy(service)
+            "paste" -> executePaste(action, nodes, service)
+            "select_all" -> executeSelectAll(action, nodes, service)
+            "open_notifications" -> { service.openNotifications(); "✅ Notifications khol diya" }
             "wait" -> "⏳ Screen load ho raha hai..."
             "done" -> "✅ Kaam ho gaya!"
             else -> "❓ Unknown action: ${action.action}"
@@ -335,5 +371,79 @@ object ActionExecutor {
 
         Log.w(TAG, "App nahi mili: '$appName'")
         return "❌ '$appName' app nahi mili device pe"
+    }
+
+    // =========================================================================
+    // Long Press at coordinates
+    // =========================================================================
+    private fun executeLongPress(action: AgentAction, service: AutoAgentService): String {
+        val x = action.x ?: return "❌ x coordinate chahiye"
+        val y = action.y ?: return "❌ y coordinate chahiye"
+        service.longPressAt(x.toFloat(), y.toFloat())
+        return "✅ Long press kiya ($x, $y) pe"
+    }
+
+    // =========================================================================
+    // Screenshot
+    // =========================================================================
+    private fun executeScreenshot(service: AutoAgentService): String {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            service.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_TAKE_SCREENSHOT)
+            "✅ Screenshot le liya"
+        } else {
+            "❌ Screenshot API needs Android 9+"
+        }
+    }
+
+    // =========================================================================
+    // Clipboard: Copy / Paste / Select All
+    // =========================================================================
+    private fun executeCopy(service: AutoAgentService): String {
+        val focusedNode = service.getRootNode()?.findFocus(android.view.accessibility.AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focusedNode != null) {
+            // Select all then copy
+            focusedNode.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_SELECT)
+            val args = android.os.Bundle()
+            args.putInt(android.view.accessibility.AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+            args.putInt(android.view.accessibility.AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, focusedNode.text?.length ?: 0)
+            focusedNode.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_SET_SELECTION, args)
+            focusedNode.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_COPY)
+            return "✅ Text copy kiya"
+        }
+        return "❌ Koi text field focused nahi hai"
+    }
+
+    private fun executePaste(action: AgentAction, nodes: List<UiTreeExtractor.UiNode>, service: AutoAgentService): String {
+        // If node_id given, focus that first
+        val nodeId = action.nodeId
+        if (nodeId != null) {
+            val node = UiTreeExtractor.findNodeById(nodes, nodeId)
+                ?: UiTreeExtractor.findNodeByText(nodes, action.text ?: "")
+            if (node != null) {
+                node.nodeInfo.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_FOCUS)
+                node.nodeInfo.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK)
+                Thread.sleep(200)
+            }
+        }
+
+        val focusedNode = service.getRootNode()?.findFocus(android.view.accessibility.AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focusedNode != null) {
+            focusedNode.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_PASTE)
+            return "✅ Text paste kiya"
+        }
+        return "❌ Koi text field focused nahi hai"
+    }
+
+    private fun executeSelectAll(action: AgentAction, nodes: List<UiTreeExtractor.UiNode>, service: AutoAgentService): String {
+        val focusedNode = service.getRootNode()?.findFocus(android.view.accessibility.AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focusedNode != null) {
+            val textLength = focusedNode.text?.length ?: 0
+            val args = android.os.Bundle()
+            args.putInt(android.view.accessibility.AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+            args.putInt(android.view.accessibility.AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, textLength)
+            focusedNode.performAction(android.view.accessibility.AccessibilityNodeInfo.ACTION_SET_SELECTION, args)
+            return "✅ Sab text select kiya"
+        }
+        return "❌ Koi text field focused nahi hai"
     }
 }

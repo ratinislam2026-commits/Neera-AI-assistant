@@ -17,7 +17,13 @@ object UiTreeExtractor {
 
     private const val TAG = "UiTreeExtractor"
     private const val MAX_DEPTH = 15
-    private const val MAX_NODES = 120
+    private const val MAX_NODES = 150  // Increased for complex screens
+
+    // Types to skip even if they have content (purely decorative)
+    private val SKIP_TYPES = setOf(
+        "View", "FrameLayout", "LinearLayout", "RelativeLayout",
+        "ConstraintLayout", "CardView", "CoordinatorLayout"
+    )
 
     data class UiNode(
         val id: Int,
@@ -71,6 +77,9 @@ object UiTreeExtractor {
             )
 
             if (hasSize && (hasContent || isActionable || isImportant)) {
+                // Skip decorative containers unless they are clickable/actionable
+                val isDecorativeContainer = className in SKIP_TYPES && !isActionable && !hasContent
+                if (!isDecorativeContainer) {
                 nodes.add(
                     UiNode(
                         id = idCounter++,
@@ -86,6 +95,7 @@ object UiTreeExtractor {
                         nodeInfo = node
                     )
                 )
+                }
             }
 
             // Traverse children

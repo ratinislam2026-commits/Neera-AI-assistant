@@ -429,9 +429,20 @@ private fun startBubbleService(context: Context) {
         Toast.makeText(context, "Grant overlay permission first", Toast.LENGTH_LONG).show()
         return
     }
-    context.startService(Intent(context, FloatingBubbleService::class.java).apply { action = FloatingBubbleService.ACTION_START })
+    try {
+        val intent = Intent(context, FloatingBubbleService::class.java).apply { action = FloatingBubbleService.ACTION_START }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
+        }
+    } catch (e: Exception) {
+        Toast.makeText(context, "Could not start Jarvis: ${e.message?.take(50)}", Toast.LENGTH_LONG).show()
+    }
 }
 
 private fun stopBubbleService(context: Context) {
-    context.startService(Intent(context, FloatingBubbleService::class.java).apply { action = FloatingBubbleService.ACTION_STOP })
+    try {
+        context.startService(Intent(context, FloatingBubbleService::class.java).apply { action = FloatingBubbleService.ACTION_STOP })
+    } catch (_: Exception) {}
 }

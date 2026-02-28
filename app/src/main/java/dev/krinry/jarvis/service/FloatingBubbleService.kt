@@ -1,7 +1,10 @@
 package dev.krinry.jarvis.service
 
 import android.animation.ValueAnimator
-import android.app.AlertDialog
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -9,10 +12,14 @@ import android.graphics.PixelFormat
 import android.graphics.Typeface
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
@@ -27,6 +34,8 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.app.NotificationCompat
+import dev.krinry.jarvis.MainActivity
 import dev.krinry.jarvis.R
 import dev.krinry.jarvis.agent.AgentLlmEngine
 import dev.krinry.jarvis.ai.GroqApiClient
@@ -40,11 +49,15 @@ import java.nio.ByteOrder
  * FloatingBubbleService — Always-on-top overlay bubble for Jarvis AI.
  *
  * Features:
+ * - Foreground service with notification (won't be killed by Android)
  * - Tap to START recording → tap again to STOP and process
- * - Long-press for menu: Clear subtitles, Keep screen on
- * - Subtitle-style scrolling transcript (does NOT auto-disappear)
- * - Pulse animation while listening
- * - Draggable
+ * - Long-press for menu: Clear subtitles, Keep screen on, Repeat last
+ * - Subtitle-style scrolling transcript (NO auto-disappear)
+ * - Pulse animation while listening, orbit animation while thinking
+ * - Vibration feedback on start/stop
+ * - Sound effect on task complete
+ * - Draggable bubble
+ * - Double-tap to repeat last command
  */
 class FloatingBubbleService : Service() {
 
@@ -52,6 +65,8 @@ class FloatingBubbleService : Service() {
         private const val TAG = "FloatingBubble"
         const val ACTION_START = "dev.krinry.jarvis.START_BUBBLE"
         const val ACTION_STOP = "dev.krinry.jarvis.STOP_BUBBLE"
+        private const val NOTIFICATION_ID = 42
+        private const val CHANNEL_ID = "jarvis_agent_channel"
 
         private const val MAX_RECORDING_SECONDS = 10
         private const val SAMPLE_RATE = 16000
@@ -83,6 +98,13 @@ class FloatingBubbleService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var keepScreenOn = false
 
+    // Double-tap & last command
+    private var lastTapTime = 0L
+    private var lastCommand: String? = null
+
+    // Thinking animation
+    private var thinkingAnimator: ValueAnimator? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -92,13 +114,20 @@ class FloatingBubbleService : Service() {
         agentEngine?.onStatusUpdate = { status ->
             scope.launch(Dispatchers.Main) {
                 addSubtitle(status)
-                if (status.startsWith("✅") || status.startsWith("❌") ||
-                    status.startsWith("⚠️") || status.startsWith("⏹")) {
+                if (status.startsWith("✅")) {
                     isProcessingCommand = false
+                    stopThinkingAnimation()
+                    playCompletionSound()
+                    vibratePattern(longArrayOf(0, 80, 60, 80)) // success pattern
+                } else if (status.startsWith("❌") || status.startsWith("⚠️") || status.startsWith("⏹")) {
+                    isProcessingCommand = false
+                    stopThinkingAnimation()
+                    vibrateShort()
                 }
             }
         }
         isRunning = true
+        startForegroundNotification()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -113,11 +142,56 @@ class FloatingBubbleService : Service() {
         isRunning = false
         scope.cancel()
         stopRecording()
+        stopThinkingAnimation()
         releaseWakeLock()
-        bubbleView?.let { windowManager.removeView(it) }
-        subtitleView?.let { windowManager.removeView(it) }
+        bubbleView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
+        subtitleView?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
         bubbleView = null; subtitleView = null
         super.onDestroy()
+    }
+
+    // =========================================================================
+    // === Foreground Notification (prevents Android from killing service) ===
+    // =========================================================================
+
+    private fun startForegroundNotification() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID, "Jarvis AI Agent",
+                    NotificationManager.IMPORTANCE_LOW
+                ).apply {
+                    description = "Jarvis background service"
+                    setShowBadge(false)
+                }
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.createNotificationChannel(channel)
+            }
+
+            val openApp = PendingIntent.getActivity(
+                this, 0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle("Jarvis Active")
+                .setContentText("Tap bubble to give command")
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setOngoing(true)
+                .setContentIntent(openApp)
+                .build()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not start foreground service: ${e.message}")
+            // Service still works, just not as foreground — may be killed by system
+        }
     }
 
     // =========================================================================
@@ -153,12 +227,12 @@ class FloatingBubbleService : Service() {
             x = dpToPx(10); y = dpToPx(400)
         }
 
-        // Touch: drag + tap + long press
+        // Touch: drag + tap + double-tap + long press
         var initialX = 0; var initialY = 0
         var initialTouchX = 0f; var initialTouchY = 0f
         var isMoved = false
         val longPressHandler = android.os.Handler(android.os.Looper.getMainLooper())
-        val longPressRunnable = Runnable { if (!isMoved) showBubbleMenu() }
+        val longPressRunnable = Runnable { if (!isMoved) { vibrateShort(); showBubbleMenu() } }
 
         bubble.setOnTouchListener { _, event ->
             when (event.action) {
@@ -184,7 +258,14 @@ class FloatingBubbleService : Service() {
                 MotionEvent.ACTION_UP -> {
                     longPressHandler.removeCallbacks(longPressRunnable)
                     if (!isMoved) {
-                        onBubbleTapped()
+                        val now = System.currentTimeMillis()
+                        if (now - lastTapTime < 350 && lastCommand != null) {
+                            // Double-tap: repeat last command
+                            onDoubleTap()
+                        } else {
+                            onBubbleTapped()
+                        }
+                        lastTapTime = now
                     }
                     true
                 }
@@ -242,11 +323,11 @@ class FloatingBubbleService : Service() {
         else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
 
         val menuItems = mutableListOf<String>()
+        menuItems.add("🔄 Repeat Last Command")
         menuItems.add("🗑️ Clear Subtitles")
         menuItems.add(if (keepScreenOn) "🌙 Screen: Auto-off" else "☀️ Screen: Always On")
         menuItems.add("❌ Close Jarvis")
 
-        // Show menu using a custom overlay
         val menuLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dpToPx(16), dpToPx(12), dpToPx(16), dpToPx(12))
@@ -273,29 +354,41 @@ class FloatingBubbleService : Service() {
                 setTextColor(0xFFFFFFFF.toInt())
                 setPadding(dpToPx(20), dpToPx(14), dpToPx(20), dpToPx(14))
                 setOnClickListener {
-                    windowManager.removeView(menuLayout)
+                    try { windowManager.removeView(menuLayout) } catch (_: Exception) {}
                     when (index) {
-                        0 -> clearSubtitles()
-                        1 -> toggleKeepScreenOn()
-                        2 -> stopSelf()
+                        0 -> repeatLastCommand()
+                        1 -> clearSubtitles()
+                        2 -> toggleKeepScreenOn()
+                        3 -> stopSelf()
                     }
                 }
             }
             menuLayout.addView(tv)
         }
 
-        // Dismiss on outside tap
         menuLayout.setOnClickListener {
-            windowManager.removeView(menuLayout)
+            try { windowManager.removeView(menuLayout) } catch (_: Exception) {}
         }
 
         windowManager.addView(menuLayout, menuParams)
 
-        // Auto-dismiss after 5 sec
         scope.launch {
             delay(5000)
             try { windowManager.removeView(menuLayout) } catch (_: Exception) {}
         }
+    }
+
+    private fun repeatLastCommand() {
+        val cmd = lastCommand
+        if (cmd.isNullOrBlank()) {
+            addSubtitle("❌ No previous command")
+            return
+        }
+        isProcessingCommand = true
+        subtitleHistory.clear()
+        addSubtitle("🔄 Repeating: \"$cmd\"")
+        startThinkingAnimation()
+        agentEngine?.startTask(cmd, scope)
     }
 
     private fun toggleKeepScreenOn() {
@@ -318,25 +411,21 @@ class FloatingBubbleService : Service() {
                 "jarvis:screenon"
             )
         }
-        wakeLock?.acquire(60 * 60 * 1000L) // 1 hour max
+        wakeLock?.acquire(60 * 60 * 1000L)
     }
 
     private fun releaseWakeLock() {
-        try {
-            if (wakeLock?.isHeld == true) wakeLock?.release()
-        } catch (_: Exception) {}
+        try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
         wakeLock = null
     }
 
     // =========================================================================
-    // === Subtitle System (NO auto-hide — user clears manually) ===
+    // === Subtitle System ===
     // =========================================================================
 
     private fun addSubtitle(text: String) {
         subtitleHistory.add(text)
-        while (subtitleHistory.size > MAX_SUBTITLE_LINES) {
-            subtitleHistory.removeAt(0)
-        }
+        while (subtitleHistory.size > MAX_SUBTITLE_LINES) subtitleHistory.removeAt(0)
 
         subtitleView?.let { view ->
             if (view.visibility != View.VISIBLE) {
@@ -361,7 +450,7 @@ class FloatingBubbleService : Service() {
     }
 
     // =========================================================================
-    // === Bubble Tap ===
+    // === Bubble Tap / Double-Tap ===
     // =========================================================================
 
     private fun onBubbleTapped() {
@@ -369,11 +458,99 @@ class FloatingBubbleService : Service() {
             agentEngine?.cancelTask()
             isProcessingCommand = false
             stopRecording()
+            stopThinkingAnimation()
             addSubtitle("⏹ Cancelled")
+            vibrateShort()
             return
         }
         if (isListening) stopRecordingAndProcess()
         else startWhisperRecording()
+    }
+
+    private fun onDoubleTap() {
+        vibratePattern(longArrayOf(0, 50, 40, 50))
+        repeatLastCommand()
+    }
+
+    // =========================================================================
+    // === Vibration & Sound ===
+    // =========================================================================
+
+    private fun vibrateShort() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                vm.defaultVibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    v.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION") v.vibrate(50)
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun vibratePattern(pattern: LongArray) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
+                vm.defaultVibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+            } else {
+                @Suppress("DEPRECATION")
+                val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    v.vibrate(VibrationEffect.createWaveform(pattern, -1))
+                } else {
+                    @Suppress("DEPRECATION") v.vibrate(pattern, -1)
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun playCompletionSound() {
+        try {
+            // Use system notification sound as completion tone
+            val mp = MediaPlayer.create(this, android.provider.Settings.System.DEFAULT_NOTIFICATION_URI)
+            mp?.setOnCompletionListener { it.release() }
+            mp?.start()
+        } catch (_: Exception) {}
+    }
+
+    // =========================================================================
+    // === Thinking Animation (rotating glow while LLM processing) ===
+    // =========================================================================
+
+    private fun startThinkingAnimation() {
+        bubbleView?.let { view ->
+            thinkingAnimator?.cancel()
+            thinkingAnimator = ValueAnimator.ofFloat(0f, 360f).apply {
+                duration = 2000
+                repeatCount = ValueAnimator.INFINITE
+                interpolator = AccelerateDecelerateInterpolator()
+                addUpdateListener { anim ->
+                    val angle = anim.animatedValue as Float
+                    view.rotation = angle
+                    // Subtle pulse
+                    val scale = 1f + 0.08f * Math.sin(Math.toRadians(angle.toDouble() * 2)).toFloat()
+                    view.scaleX = scale
+                    view.scaleY = scale
+                }
+            }
+            thinkingAnimator?.start()
+        }
+    }
+
+    private fun stopThinkingAnimation() {
+        thinkingAnimator?.cancel()
+        thinkingAnimator = null
+        bubbleView?.let { view ->
+            view.rotation = 0f
+            view.scaleX = 1f
+            view.scaleY = 1f
+        }
     }
 
     // =========================================================================
@@ -388,6 +565,7 @@ class FloatingBubbleService : Service() {
 
         isListening = true
         animateBubble(true)
+        vibrateShort()
         addSubtitle("🎤 Listening... tap to send")
 
         recordingJob = scope.launch(Dispatchers.IO) {
@@ -417,7 +595,12 @@ class FloatingBubbleService : Service() {
                     return@launch
                 }
 
-                withContext(Dispatchers.Main) { isListening = false; animateBubble(false); addSubtitle("🔄 Transcribing...") }
+                withContext(Dispatchers.Main) {
+                    isListening = false
+                    animateBubble(false)
+                    vibrateShort()
+                    addSubtitle("🔄 Transcribing...")
+                }
 
                 val wavFile = saveAsWav(audioBuffer)
                 if (wavFile == null) { withContext(Dispatchers.Main) { addSubtitle("❌ Failed to save audio") }; return@launch }
@@ -430,13 +613,14 @@ class FloatingBubbleService : Service() {
                         addSubtitle("❌ Couldn't understand, try again")
                     } else {
                         val command = stripWakeWord(transcript)
+                        lastCommand = command
                         isProcessingCommand = true
                         subtitleHistory.clear()
                         addSubtitle("🗣️ \"$command\"")
+                        startThinkingAnimation()
                         agentEngine?.startTask(command, scope)
                     }
                 }
-
             } catch (e: Exception) {
                 Log.e(TAG, "Whisper recording failed", e)
                 withContext(Dispatchers.Main) { isListening = false; animateBubble(false); addSubtitle("❌ Error: ${e.message?.take(40)}") }
@@ -445,7 +629,9 @@ class FloatingBubbleService : Service() {
     }
 
     private fun stopRecordingAndProcess() {
-        isListening = false; animateBubble(false); addSubtitle("🔄 Processing...")
+        isListening = false; animateBubble(false)
+        vibrateShort()
+        addSubtitle("🔄 Processing...")
     }
 
     private fun stopRecording() {
