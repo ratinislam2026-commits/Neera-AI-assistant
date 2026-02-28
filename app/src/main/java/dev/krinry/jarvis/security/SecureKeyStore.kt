@@ -7,7 +7,7 @@ import androidx.security.crypto.MasterKey
 
 /**
  * Secure storage for API keys and agent settings.
- * Supports: Groq, OpenRouter, model selection, request delay.
+ * Supports: generic provider API keys, model selection, request delay.
  */
 object SecureKeyStore {
 
@@ -76,6 +76,30 @@ object SecureKeyStore {
     fun hasOpenRouterApiKey(context: Context): Boolean = !getOpenRouterApiKey(context).isNullOrEmpty()
 
     // =========================================================================
+    // === Generic Provider API Key ===
+    // =========================================================================
+
+    fun saveProviderApiKey(context: Context, providerId: String, apiKey: String) {
+        getEncryptedPrefs(context).edit().putString("provider_key_$providerId", apiKey).apply()
+        // Also save in legacy keys for backward compat
+        when (providerId) {
+            "groq" -> saveGroqApiKey(context, apiKey)
+            "openrouter" -> saveOpenRouterApiKey(context, apiKey)
+        }
+    }
+
+    fun getProviderApiKey(context: Context, providerId: String): String? {
+        // Check new generic key first, then fallback to legacy
+        val generic = getEncryptedPrefs(context).getString("provider_key_$providerId", null)
+        if (!generic.isNullOrEmpty()) return generic
+        return when (providerId) {
+            "groq" -> getGroqApiKey(context)
+            "openrouter" -> getOpenRouterApiKey(context)
+            else -> null
+        }
+    }
+
+    // =========================================================================
     // === API Provider (groq / openrouter) ===
     // =========================================================================
 
@@ -116,7 +140,7 @@ object SecureKeyStore {
     }
 
     fun getRequestDelayMs(context: Context): Long {
-        return getEncryptedPrefs(context).getLong(KEY_REQUEST_DELAY_MS, 2000L)
+        return getEncryptedPrefs(context).getLong(KEY_REQUEST_DELAY_MS, 500L)
     }
 
     // =========================================================================

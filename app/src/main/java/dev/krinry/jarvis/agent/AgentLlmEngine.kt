@@ -25,7 +25,7 @@ class AgentLlmEngine(private val context: Context) {
     companion object {
         private const val TAG = "AgentLlmEngine"
         private const val MAX_ITERATIONS = 30
-        private const val SCREEN_SETTLE_DELAY = 1500L
+        private const val SCREEN_SETTLE_DELAY = 600L
         private const val MAX_HISTORY_MESSAGES = 20
 
         private const val SYSTEM_PROMPT = """You are Krinry, a powerful AI phone assistant with FULL device control. You control the phone through AccessibilityService. You respond ONLY in JSON.
@@ -153,19 +153,20 @@ One JSON object per response."""
             // 3. Hindi status
             onStatusUpdate?.invoke("🤔 Soch raha hoon... (step $iteration)")
 
-            // 4. LLM call
+            // 4. LLM call (GroqApiClient handles retries internally)
+            onStatusUpdate?.invoke("⚡ Calling AI...")
             val llmResponse = try {
                 GroqApiClient.agentChat(context, SYSTEM_PROMPT, conversationHistory, userMessage)
             } catch (e: Exception) {
-                Log.e(TAG, "LLM call failed", e)
-                onStatusUpdate?.invoke("❌ Server se baat nahi ho payi")
-                ttsManager.speak("Server se connection nahi ho paya. Phir try karo.")
+                Log.e(TAG, "LLM call failed: ${e.message}")
+                onStatusUpdate?.invoke("❌ ${e.message?.take(50) ?: "Server error"}")
+                ttsManager.speak("Server se jawab nahi aaya.")
                 return
             }
 
             if (llmResponse == null) {
-                onStatusUpdate?.invoke("❌ Server ne jawab nahi diya")
-                ttsManager.speak("Server jawab nahi de raha. Thodi der baad try karo.")
+                onStatusUpdate?.invoke("❌ Empty response from server")
+                ttsManager.speak("Server ne koi jawab nahi diya.")
                 return
             }
 
@@ -209,10 +210,14 @@ One JSON object per response."""
             Log.d(TAG, "Result: $result")
             onStatusUpdate?.invoke(result)
 
-            // If action failed, inform via TTS
+            // If action failed, inform LLM through conversation context
             if (result.startsWith("❌")) {
                 Log.w(TAG, "Action failed: $result")
-                // Don't stop — let LLM try again with new screen state
+                // Add failure to history so LLM can adapt strategy
+                conversationHistory.add("user" to "SYSTEM: Previous action failed. Error: $result. Try a different approach.")
+                while (conversationHistory.size > MAX_HISTORY_MESSAGES) {
+                    conversationHistory.removeAt(0)
+                }
             }
 
             // 11. Screen settle hone do
