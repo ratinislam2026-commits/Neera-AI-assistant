@@ -5,20 +5,26 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
+import android.graphics.Typeface
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
+import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.AlphaAnimation
+import android.view.animation.AnimationSet
+import android.view.animation.TranslateAnimation
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import dev.krinry.jarvis.R
 import dev.krinry.jarvis.agent.AgentLlmEngine
@@ -32,14 +38,12 @@ import java.nio.ByteOrder
 /**
  * FloatingBubbleService — Always-on-top overlay bubble for Jarvis AI.
  *
- * STT: Uses Groq Whisper (NOT Android SpeechRecognizer) for much better
- *      accuracy, especially for Hindi/English mixed commands.
- *
- * - Tap the bubble to START recording
+ * Features:
+ * - Tap bubble to START recording
  * - Tap again to STOP and process command
- * - Hold to manually stop without processing
- * - Shows listening animation & agent status
- * - Draggable
+ * - Subtitle-style scrolling transcript display
+ * - Pulse animation while listening
+ * - Draggable bubble
  */
 class FloatingBubbleService : Service() {
 
@@ -48,11 +52,11 @@ class FloatingBubbleService : Service() {
         const val ACTION_START = "dev.krinry.jarvis.START_BUBBLE"
         const val ACTION_STOP = "dev.krinry.jarvis.STOP_BUBBLE"
 
-        // Auto-stop recording after this many seconds of silence / max duration
         private const val MAX_RECORDING_SECONDS = 10
         private const val SAMPLE_RATE = 16000
+        private const val MAX_SUBTITLE_LINES = 4
+        private const val SUBTITLE_FADE_DELAY = 4000L
 
-        // Wake words stripped from commands
         private val WAKE_WORDS = listOf(
             "krinry", "cranary", "kri nri", "crinary", "cranery", "krinari", "jarvis",
             "crinri", "grini", "krinry,", "jarvis,"
@@ -65,7 +69,7 @@ class FloatingBubbleService : Service() {
 
     private lateinit var windowManager: WindowManager
     private var bubbleView: View? = null
-    private var statusView: View? = null
+    private var subtitleView: View? = null
     private var agentEngine: AgentLlmEngine? = null
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
@@ -73,6 +77,8 @@ class FloatingBubbleService : Service() {
     private var isProcessingCommand = false
     private var recordingJob: Job? = null
     private var audioRecord: AudioRecord? = null
+    private var subtitleHideJob: Job? = null
+    private val subtitleHistory = mutableListOf<String>()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -82,12 +88,16 @@ class FloatingBubbleService : Service() {
         agentEngine = AgentLlmEngine(applicationContext)
         agentEngine?.onStatusUpdate = { status ->
             scope.launch(Dispatchers.Main) {
-                updateStatusText(status)
+                addSubtitle(status)
                 if (status.startsWith("✅") || status.startsWith("❌") ||
                     status.startsWith("⚠️") || status.startsWith("⏹")) {
                     isProcessingCommand = false
-                    delay(3000)
-                    hideStatus()
+                    // Auto-hide subtitles after task completion
+                    subtitleHideJob?.cancel()
+                    subtitleHideJob = scope.launch {
+                        delay(5000)
+                        hideSubtitles()
+                    }
                 }
             }
         }
@@ -112,9 +122,9 @@ class FloatingBubbleService : Service() {
         scope.cancel()
         stopRecording()
         bubbleView?.let { windowManager.removeView(it) }
-        statusView?.let { windowManager.removeView(it) }
+        subtitleView?.let { windowManager.removeView(it) }
         bubbleView = null
-        statusView = null
+        subtitleView = null
         super.onDestroy()
     }
 
@@ -125,15 +135,16 @@ class FloatingBubbleService : Service() {
             @Suppress("DEPRECATION")
             WindowManager.LayoutParams.TYPE_PHONE
 
-        // === Bubble button ===
-        val bubbleSize = dpToPx(56)
+        // === Floating Bubble Button ===
+        val bubbleSize = dpToPx(54)
         val bubble = FrameLayout(this).apply {
             background = createBubbleDrawable()
+            elevation = dpToPx(8).toFloat()
         }
 
         val icon = ImageView(this).apply {
             setImageResource(android.R.drawable.ic_btn_speak_now)
-            val padding = dpToPx(14)
+            val padding = dpToPx(13)
             setPadding(padding, padding, padding, padding)
         }
         bubble.addView(icon, FrameLayout.LayoutParams(
@@ -149,40 +160,30 @@ class FloatingBubbleService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dpToPx(12)
+            x = dpToPx(10)
             y = dpToPx(400)
         }
 
         // Touch — drag + tap
-        var initialX = 0
-        var initialY = 0
-        var initialTouchX = 0f
-        var initialTouchY = 0f
+        var initialX = 0; var initialY = 0
+        var initialTouchX = 0f; var initialTouchY = 0f
         var isMoved = false
 
         bubble.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    initialX = bubbleParams.x
-                    initialY = bubbleParams.y
-                    initialTouchX = event.rawX
-                    initialTouchY = event.rawY
-                    isMoved = false
-                    true
+                    initialX = bubbleParams.x; initialY = bubbleParams.y
+                    initialTouchX = event.rawX; initialTouchY = event.rawY
+                    isMoved = false; true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.rawX - initialTouchX).toInt()
                     val dy = (event.rawY - initialTouchY).toInt()
                     if (Math.abs(dx) > 10 || Math.abs(dy) > 10) isMoved = true
-                    bubbleParams.x = initialX + dx
-                    bubbleParams.y = initialY + dy
-                    windowManager.updateViewLayout(bubble, bubbleParams)
-                    true
+                    bubbleParams.x = initialX + dx; bubbleParams.y = initialY + dy
+                    windowManager.updateViewLayout(bubble, bubbleParams); true
                 }
-                MotionEvent.ACTION_UP -> {
-                    if (!isMoved) onBubbleTapped()
-                    true
-                }
+                MotionEvent.ACTION_UP -> { if (!isMoved) onBubbleTapped(); true }
                 else -> false
             }
         }
@@ -190,26 +191,30 @@ class FloatingBubbleService : Service() {
         windowManager.addView(bubble, bubbleParams)
         bubbleView = bubble
 
-        // === Status text overlay ===
-        val statusLayout = LinearLayout(this).apply {
+        // === Subtitle overlay (bottom of screen) ===
+        val subtitleContainer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dpToPx(16), dpToPx(8), dpToPx(16), dpToPx(8))
-            background = createStatusDrawable()
+            setPadding(dpToPx(20), dpToPx(10), dpToPx(20), dpToPx(10))
+            background = createSubtitleBackground()
             visibility = View.GONE
         }
 
-        val statusText = TextView(this).apply {
+        val subtitleText = TextView(this).apply {
             id = View.generateViewId()
-            tag = "status_text"
-            text = "🎤 Tap to speak..."
-            textSize = 13f
+            tag = "subtitle_text"
+            text = ""
+            textSize = 14f
             setTextColor(0xFFFFFFFF.toInt())
-            maxLines = 2
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            maxLines = MAX_SUBTITLE_LINES
+            ellipsize = TextUtils.TruncateAt.END
+            setShadowLayer(4f, 0f, 2f, 0x80000000.toInt())
+            lineHeight = dpToPx(22)
         }
-        statusLayout.addView(statusText)
+        subtitleContainer.addView(subtitleText)
 
-        val statusParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
+        val subtitleParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
@@ -217,24 +222,90 @@ class FloatingBubbleService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = dpToPx(100)
+            y = dpToPx(80)
         }
 
-        windowManager.addView(statusLayout, statusParams)
-        statusView = statusLayout
+        windowManager.addView(subtitleContainer, subtitleParams)
+        subtitleView = subtitleContainer
     }
+
+    // =========================================================================
+    // === Subtitle System ===
+    // =========================================================================
+
+    /**
+     * Add a new subtitle line. Old lines scroll out, new lines fade in.
+     * Works like real-time subtitles on a video.
+     */
+    private fun addSubtitle(text: String) {
+        subtitleHideJob?.cancel()
+
+        subtitleHistory.add(text)
+        // Keep only recent lines
+        while (subtitleHistory.size > MAX_SUBTITLE_LINES) {
+            subtitleHistory.removeAt(0)
+        }
+
+        subtitleView?.let { view ->
+            if (view.visibility != View.VISIBLE) {
+                view.visibility = View.VISIBLE
+                // Slide-in animation
+                val slideUp = TranslateAnimation(0f, 0f, dpToPx(30).toFloat(), 0f).apply {
+                    duration = 250
+                }
+                val fadeIn = AlphaAnimation(0f, 1f).apply { duration = 250 }
+                val animSet = AnimationSet(true).apply {
+                    addAnimation(slideUp)
+                    addAnimation(fadeIn)
+                }
+                view.startAnimation(animSet)
+            }
+
+            val tv = view.findViewWithTag<TextView>("subtitle_text")
+            tv?.text = subtitleHistory.joinToString("\n")
+        }
+
+        // Auto-hide after idle
+        subtitleHideJob = scope.launch {
+            delay(SUBTITLE_FADE_DELAY)
+            if (!isProcessingCommand && !isListening) {
+                hideSubtitles()
+            }
+        }
+    }
+
+    private fun hideSubtitles() {
+        subtitleView?.let { view ->
+            if (view.visibility == View.VISIBLE) {
+                val fadeOut = AlphaAnimation(1f, 0f).apply { duration = 300 }
+                view.startAnimation(fadeOut)
+                scope.launch {
+                    delay(300)
+                    view.visibility = View.GONE
+                    subtitleHistory.clear()
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // === Bubble Tap Logic ===
+    // =========================================================================
 
     private fun onBubbleTapped() {
         if (isProcessingCommand) {
-            // Cancel current task
             agentEngine?.cancelTask()
             isProcessingCommand = false
             stopRecording()
-            hideStatus()
+            addSubtitle("⏹ Cancelled")
+            subtitleHideJob?.cancel()
+            subtitleHideJob = scope.launch {
+                delay(2000)
+                hideSubtitles()
+            }
             return
         }
         if (isListening) {
-            // Stop recording and process
             stopRecordingAndProcess()
         } else {
             startWhisperRecording()
@@ -245,19 +316,15 @@ class FloatingBubbleService : Service() {
     // === Whisper STT Recording ===
     // =========================================================================
 
-    /**
-     * Start recording audio using AudioRecord (raw PCM).
-     * User taps again to stop and send to Whisper.
-     */
     private fun startWhisperRecording() {
         if (!AutoAgentService.isRunning()) {
-            updateStatusText("❌ Enable Accessibility Service first!")
+            addSubtitle("❌ Enable Accessibility Service first!")
             return
         }
 
         isListening = true
         animateBubble(true)
-        updateStatusText("🎤 Recording... tap to send")
+        addSubtitle("🎤 Listening... tap to send")
 
         recordingJob = scope.launch(Dispatchers.IO) {
             try {
@@ -277,7 +344,7 @@ class FloatingBubbleService : Service() {
 
                 if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                     withContext(Dispatchers.Main) {
-                        updateStatusText("❌ Microphone unavailable")
+                        addSubtitle("❌ Microphone unavailable")
                         isListening = false
                         animateBubble(false)
                     }
@@ -301,10 +368,9 @@ class FloatingBubbleService : Service() {
                     }
                 }
 
-                // Auto-stop if max duration reached
                 if (audioBuffer.size >= maxSamples) {
                     withContext(Dispatchers.Main) {
-                        Log.d(TAG, "Max recording duration reached, auto-processing")
+                        Log.d(TAG, "Max recording duration reached")
                     }
                 }
 
@@ -316,9 +382,7 @@ class FloatingBubbleService : Service() {
                     withContext(Dispatchers.Main) {
                         isListening = false
                         animateBubble(false)
-                        updateStatusText("❌ No audio captured")
-                        delay(2000)
-                        hideStatus()
+                        addSubtitle("❌ No audio captured")
                     }
                     return@launch
                 }
@@ -326,40 +390,34 @@ class FloatingBubbleService : Service() {
                 withContext(Dispatchers.Main) {
                     isListening = false
                     animateBubble(false)
-                    updateStatusText("🔄 Transcribing with Whisper...")
+                    addSubtitle("🔄 Transcribing...")
                 }
 
-                // Save as WAV file
                 val wavFile = saveAsWav(audioBuffer)
                 if (wavFile == null) {
                     withContext(Dispatchers.Main) {
-                        updateStatusText("❌ Failed to save audio")
-                        delay(2000)
-                        hideStatus()
+                        addSubtitle("❌ Failed to save audio")
                     }
                     return@launch
                 }
 
-                // Send to Groq Whisper
                 val transcript = GroqApiClient.transcribeAudio(
                     applicationContext,
                     wavFile,
-                    null // Auto-detect language (supports Hindi + English)
+                    null
                 )
 
-                // Delete temp file
                 wavFile.delete()
 
                 withContext(Dispatchers.Main) {
                     if (transcript.isNullOrBlank()) {
-                        updateStatusText("❌ Couldn't understand, try again")
-                        delay(2000)
-                        hideStatus()
+                        addSubtitle("❌ Couldn't understand, try again")
                     } else {
                         Log.d(TAG, "Whisper transcript: $transcript")
                         val command = stripWakeWord(transcript)
                         isProcessingCommand = true
-                        updateStatusText("🧠 \"$command\"")
+                        subtitleHistory.clear() // Fresh subtitle session
+                        addSubtitle("🗣️ \"$command\"")
                         agentEngine?.startTask(command, scope)
                     }
                 }
@@ -369,24 +427,17 @@ class FloatingBubbleService : Service() {
                 withContext(Dispatchers.Main) {
                     isListening = false
                     animateBubble(false)
-                    updateStatusText("❌ Recording error: ${e.message?.take(40)}")
-                    delay(2000)
-                    hideStatus()
+                    addSubtitle("❌ Error: ${e.message?.take(40)}")
                 }
             }
         }
     }
 
-    /**
-     * Stop the recording loop and process immediately.
-     * Called when user taps bubble again during recording.
-     */
     private fun stopRecordingAndProcess() {
         Log.d(TAG, "User stopped recording manually")
         isListening = false
-        // The coroutine loop checks isListening and will exit
         animateBubble(false)
-        updateStatusText("🔄 Processing...")
+        addSubtitle("🔄 Processing...")
     }
 
     private fun stopRecording() {
@@ -401,34 +452,28 @@ class FloatingBubbleService : Service() {
         animateBubble(false)
     }
 
-    /**
-     * Save raw PCM shorts as a WAV file.
-     */
     private fun saveAsWav(audioData: List<Short>): File? {
         return try {
             val file = File(cacheDir, "whisper_input_${System.currentTimeMillis()}.wav")
             val totalPcmBytes = audioData.size * 2
 
             FileOutputStream(file).use { fos ->
-                // WAV header
                 val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
                 header.put("RIFF".toByteArray())
-                header.putInt(36 + totalPcmBytes)      // File size - 8
+                header.putInt(36 + totalPcmBytes)
                 header.put("WAVE".toByteArray())
                 header.put("fmt ".toByteArray())
-                header.putInt(16)                       // Chunk size
-                header.putShort(1)                      // PCM format
-                header.putShort(1)                      // Mono
+                header.putInt(16)
+                header.putShort(1)
+                header.putShort(1)
                 header.putInt(SAMPLE_RATE)
-                header.putInt(SAMPLE_RATE * 2)          // Byte rate (16bit mono)
-                header.putShort(2)                      // Block align
-                header.putShort(16)                     // Bits per sample
+                header.putInt(SAMPLE_RATE * 2)
+                header.putShort(2)
+                header.putShort(16)
                 header.put("data".toByteArray())
                 header.putInt(totalPcmBytes)
-
                 fos.write(header.array())
 
-                // PCM data
                 val pcmBytes = ByteBuffer.allocate(totalPcmBytes).order(ByteOrder.LITTLE_ENDIAN)
                 for (sample in audioData) {
                     pcmBytes.putShort(sample)
@@ -459,23 +504,11 @@ class FloatingBubbleService : Service() {
         return command.trim()
     }
 
-    private fun updateStatusText(text: String) {
-        statusView?.let { view ->
-            view.visibility = View.VISIBLE
-            val tv = view.findViewWithTag<TextView>("status_text")
-            tv?.text = text
-        }
-    }
-
-    private fun hideStatus() {
-        statusView?.visibility = View.GONE
-    }
-
     private fun animateBubble(listening: Boolean) {
         bubbleView?.let { view ->
-            val scale = if (listening) 1.3f else 1.0f
+            val scale = if (listening) 1.25f else 1.0f
             val animator = ValueAnimator.ofFloat(view.scaleX, scale).apply {
-                duration = 300
+                duration = 250
                 interpolator = AccelerateDecelerateInterpolator()
                 addUpdateListener { anim ->
                     val value = anim.animatedValue as Float
@@ -488,10 +521,10 @@ class FloatingBubbleService : Service() {
             if (listening) {
                 view.animate()
                     .alpha(0.6f)
-                    .setDuration(500)
+                    .setDuration(400)
                     .withEndAction {
                         if (isListening) {
-                            view.animate().alpha(1f).setDuration(500).withEndAction {
+                            view.animate().alpha(1f).setDuration(400).withEndAction {
                                 if (isListening) animateBubble(true)
                             }.start()
                         }
@@ -512,11 +545,11 @@ class FloatingBubbleService : Service() {
         }
     }
 
-    private fun createStatusDrawable(): android.graphics.drawable.GradientDrawable {
+    private fun createSubtitleBackground(): android.graphics.drawable.GradientDrawable {
         return android.graphics.drawable.GradientDrawable().apply {
             shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-            setColor(0xDD1A1A2E.toInt())
-            cornerRadius = dpToPx(20).toFloat()
+            setColor(0xCC0A0A1A.toInt()) // Semi-transparent dark
+            cornerRadius = dpToPx(16).toFloat()
         }
     }
 

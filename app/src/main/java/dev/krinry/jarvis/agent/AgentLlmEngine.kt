@@ -25,8 +25,9 @@ class AgentLlmEngine(private val context: Context) {
     companion object {
         private const val TAG = "AgentLlmEngine"
         private const val MAX_ITERATIONS = 30
-        private const val SCREEN_SETTLE_DELAY = 1500L
+        private const val SCREEN_SETTLE_DELAY = 800L
         private const val MAX_HISTORY_MESSAGES = 20
+        private const val LLM_MAX_RETRIES = 2
 
         private const val SYSTEM_PROMPT = """You are Krinry, a powerful AI phone assistant with FULL device control. You control the phone through AccessibilityService. You respond ONLY in JSON.
 
@@ -153,19 +154,29 @@ One JSON object per response."""
             // 3. Hindi status
             onStatusUpdate?.invoke("🤔 Soch raha hoon... (step $iteration)")
 
-            // 4. LLM call
-            val llmResponse = try {
-                GroqApiClient.agentChat(context, SYSTEM_PROMPT, conversationHistory, userMessage)
-            } catch (e: Exception) {
-                Log.e(TAG, "LLM call failed", e)
-                onStatusUpdate?.invoke("❌ Server se baat nahi ho payi")
-                ttsManager.speak("Server se connection nahi ho paya. Phir try karo.")
-                return
+            // 4. LLM call with retry
+            var llmResponse: String? = null
+            var lastError: Exception? = null
+            for (retry in 0..LLM_MAX_RETRIES) {
+                if (!isActive) return
+                try {
+                    llmResponse = GroqApiClient.agentChat(context, SYSTEM_PROMPT, conversationHistory, userMessage)
+                    if (llmResponse != null) break
+                } catch (e: Exception) {
+                    lastError = e
+                    Log.w(TAG, "LLM attempt ${retry + 1} failed: ${e.message}")
+                    if (retry < LLM_MAX_RETRIES) {
+                        onStatusUpdate?.invoke("🔄 Retry ${retry + 1}... server busy")
+                        delay(1500L * (retry + 1)) // Progressive backoff
+                    }
+                }
             }
 
             if (llmResponse == null) {
-                onStatusUpdate?.invoke("❌ Server ne jawab nahi diya")
-                ttsManager.speak("Server jawab nahi de raha. Thodi der baad try karo.")
+                val errMsg = lastError?.message?.take(60) ?: "No response"
+                Log.e(TAG, "LLM failed after retries: $errMsg")
+                onStatusUpdate?.invoke("❌ Server error: $errMsg")
+                ttsManager.speak("Server se jawab nahi aaya. Phir try karo.")
                 return
             }
 
@@ -209,10 +220,14 @@ One JSON object per response."""
             Log.d(TAG, "Result: $result")
             onStatusUpdate?.invoke(result)
 
-            // If action failed, inform via TTS
+            // If action failed, inform LLM through conversation context
             if (result.startsWith("❌")) {
                 Log.w(TAG, "Action failed: $result")
-                // Don't stop — let LLM try again with new screen state
+                // Add failure to history so LLM can adapt strategy
+                conversationHistory.add("user" to "SYSTEM: Previous action failed. Error: $result. Try a different approach.")
+                while (conversationHistory.size > MAX_HISTORY_MESSAGES) {
+                    conversationHistory.removeAt(0)
+                }
             }
 
             // 11. Screen settle hone do
