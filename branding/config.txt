@@ -6,10 +6,10 @@
 # =====================================================
 
 # App display name (shown on phone home screen)
-APP_NAME=Jarvis
+APP_NAME=Neera
 
 # Application package name (unique identifier)
-PACKAGE_NAME=dev.krinry.jarvis
+PACKAGE_NAME=dev.neera
 
 # Version shown to users (e.g., 1.0, 2.0-beta, 1.5.0)
 VERSION_NAME=1.0
@@ -24,7 +24,7 @@ MIN_SDK=24
 TARGET_SDK=35
 
 # Accessibility service label (shown in settings)
-ACCESSIBILITY_LABEL=Jarvis AutoAgent
+ACCESSIBILITY_LABEL=Neera AutoAgent
 
 # Accessibility service description
 ACCESSIBILITY_DESC=Enable Jarvis to automatically perform actions and navigate apps on your behalf.
